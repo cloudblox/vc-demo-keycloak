@@ -1,0 +1,49 @@
+{
+  "name": "membership-jwtvc",
+  "protocol": "oid4vc",
+  "attributes": {
+    "include.in.token.scope": "true",
+
+    "vc.format": "jwt_vc",
+    "vc.credential_configuration_id": "membership-jwtvc",
+    "vc.verifiable_credential_type": "membership",
+    "vc.credential_signing_alg": "ES256",
+    "vc.cryptographic_binding_methods_supported": "jwk",
+
+    "vc.signing_key_id": "z52UD13YgtnNPp_DA9ApobqBXIv9y1ZvQ7FZu4P9kFU",
+
+    "vc.include_in_metadata": "true"
+  },
+  "protocolMappers": [
+    {
+      "name": "given_name",
+      "protocol": "oid4vc",
+      "protocolMapper": "oid4vc-user-attribute-mapper",
+      "config": {
+        "claim.name": "given_name",
+        "userAttribute": "firstName",
+        "vc.mandatory": "false"
+      }
+    },
+    {
+      "name": "family_name",
+      "protocol": "oid4vc",
+      "protocolMapper": "oid4vc-user-attribute-mapper",
+      "config": {
+        "claim.name": "family_name",
+        "userAttribute": "lastName",
+        "vc.mandatory": "false"
+      }
+    },
+    {
+      "name": "email",
+      "protocol": "oid4vc",
+      "protocolMapper": "oid4vc-user-attribute-mapper",
+      "config": {
+        "claim.name": "email",
+        "userAttribute": "email",
+        "vc.mandatory": "false"
+      }
+    }
+  ]
+}

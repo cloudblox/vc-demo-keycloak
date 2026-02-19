@@ -1,0 +1,88 @@
+version: "3.9"
+
+services:
+  zinnl-keycloak-db:
+    image: postgres:16
+    container_name: zinnl-keycloak-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${KC_DB_USERNAME}
+      POSTGRES_USER: ${KC_DB_USERNAME}
+      POSTGRES_PASSWORD: ${KC_DB_PASSWORD}
+    volumes:
+      - keycloak_db:/var/lib/postgresql/data
+
+  zinnl-keycloak:
+    image: quay.io/keycloak/keycloak:26.5.3
+    container_name: zinnl-keycloak
+    restart: unless-stopped
+    depends_on:
+      - zinnl-keycloak-db
+    ports:
+      - "8090:8080"
+    environment:
+      KC_FEATURES: "preview,oid4vc-vci"
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://zinnl-keycloak-db:5432/${KC_DB_USERNAME}
+      KC_DB_USERNAME: ${KC_DB_USERNAME}
+      KC_DB_PASSWORD: ${KC_DB_PASSWORD}
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+      KC_HTTP_ENABLED: "false"
+      #KC_HTTPS_CERTIFICATE_FILE: /opt/keycloak/data/keycloak.crt
+      #KC_HTTPS_CERTIFICATE_KEY_FILE: /opt/keycloak/data/keycloak.key
+
+      # Strongly recommended for “production-ish” behavior
+      KC_HOSTNAME: vecozo-keycloak.vuggie.net
+      KC_HOSTNAME_STRICT: "true"
+      KC_PROXY_HEADERS: "xforwarded"
+    command: ["start-dev", "--import-realm","--features=oid4vc-vci"]
+    volumes:
+      - ./keycloak-import:/opt/keycloak/data/import:ro
+      - ../certs:/opt/keycloak/data/
+
+  # zorgkantoor
+  wallet:
+    build: ./wallet
+    environment:
+      # make wallet listen on 3000 in-container
+      PORT: "3000"
+
+      KC_BASE: "https://vecozo-keycloak.vuggie.net"
+      REALM: "vc-demo"
+      WALLET_CLIENT_ID: "zorgkantoor-wallet"
+      VC_CONFIG_ID: "zorgkantoor-jwtvc"
+      HOLDER_KEY_PATH: /data/holder-ec256.pem
+
+      # FIXED (no stray spaces in key names)
+      REDIRECT_URI: "https://zorgkantoor-wallet.vuggie.net/callback"
+      REQUESTED_SCOPE: "openid zorgkantoor-jwtvc"
+
+      # Recommended for localhost issuer demo (no DID resolution needed)
+      PROOF_KID_MODE: "did"
+      DID_WEB: "did:web:zorgkantoor-wallet.vuggie.net"
+    ports:
+      - "3000:3000"
+    volumes:
+      - wallet-data:/data
+
+  # ciz
+  verifier:
+    build: ./verifier
+    environment:
+      KC_BASE: "https://vecozo-keycloak.vuggie.net"
+      REALM: "vc-demo"
+      EXPECTED_VC_CONFIG_ID: "zorgkantoor-jwtvc"
+      EXPECTED_VCT: ""   # optional
+      DID_WEB: did:web:ciz-verifier.vuggie.net
+      VERIFIER_KEY_PATH: /data/verifier-ec256.pem
+    ports:
+      - "8002:8000"
+    volumes:
+      - verifier-data:/data
+
+
+volumes:
+  keycloak_db:
+  verifier-data:
+  wallet-data:

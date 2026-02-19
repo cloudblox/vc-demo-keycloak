@@ -1,0 +1,184 @@
+export KC_BASE="https://vecozo-keycloak.vuggie.net"
+export REALM="vc-demo"
+
+curl -sS "$KC_BASE/realms/$REALM/.well-known/openid-configuration" | jq
+
+
+- Assigned the role manage-realm to admin user in master realm
+
+
+Checken of OID4VC endpoints ge exposed zijnL:
+
+export KC_BASE="https://vecozo-keycloak.vuggie.net"
+export REALM="vc-demo"
+
+curl -sS "$KC_BASE/realms/$REALM/.well-known/openid-configuration" \
+| jq '{issuer, authorization_endpoint, token_endpoint, jwks_uri}'
+
+
+1) Create the VC definition as a client-scope (protocol = oid4vc)
+
+./createClientScopeZK2.sh werkt wel
+./createClientScopeZK.sh werkt niet (OID4VC scope)
+
+	1.	mappers toevoegen zodat jouw Zorgkantoor-attributen in de VC komen
+	2.	controleren of de OID4VCI issuer endpoints live zijn (zodat we een credential offer kunnen maken)
+
+  had to make Fix in order to make support for OID4VCI work in Keycloak 25.0.0, see
+
+  curl -sS "$KC_BASE/admin/realms/$REALM/client-scopes/$SCOPE_ID" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+| jq '{id,name,protocol,attributes}'
+{
+  "id": "479bbd00-026a-43b9-a1e9-58aa6cb55c9a",
+  "name": "zorgkantoor-jwtvc",
+  "protocol": "oid4vc",
+  "attributes": {
+    "vc.credential_configuration_id": "zorgkantoor-jwtvc",
+    "vc.verifiable_credential_type": "ZorgkantoorCredential",
+    "vc.include_in_metadata": "true",
+    "consent.screen.text": "Zorgkantoor VC",
+    "vc.format": "jwt_vc",
+    "include.in.token.scope": "true",
+    "vc.credential_signing_alg": "ES256",
+    "display.on.consent.screen": "true",
+    "vc.cryptographic_binding_methods_supported": "jwk"
+  }
+}
+
+curl -sS "$KC_BASE/admin/realms/$REALM/client-scopes" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+| jq -r '.[] | select(.protocol=="oid4vc") | "\(.name)\t\(.attributes["vc.credential_configuration_id"] // "-")\t\(.attributes["vc.include_in_metadata"] // "-")"'
+oid4vc_natural_person   -       -
+zorgkantoor-jwtvc       zorgkantoor-jwtvc       true
+membership-credential   -       -
+
+
+Registreer de jwt_vc CredentialBuilder (in jouw realm vc-demo)
+
+Je moet een user in jouw realm aanmaken met de role 
+“Offer-creator” user token (in realm vc-demo)
+
+Doel: Keycloak laten genereren:
+	•	credential offer
+	•	pre-authorized_code
+
+
+checkUser.sh
+KC_BASE="https://vecozo-keycloak.vuggie.net"
+REALM="vc-demo"
+USERNAME="vecozo-offerbot"
+
+USER_ID=$(curl -sS "$KC_BASE/admin/realms/$REALM/users?username=$USERNAME" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.[0].id')
+
+echo "USER_ID=$USER_ID"
+
+
+checkClientId
+RM_ID=$(curl -sS "$KC_BASE/admin/realms/$REALM/clients?clientId=realm-management" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.[0].id')
+
+echo "RM_ID=$RM_ID"
+
+
+2) Zorg dat je Wallet client “mag” vragen om de VC scope
+
+Je hebt in Keycloak meestal nodig:
+	•	Een OIDC client voor je wallet (public/confidential, afhankelijk van je flow)
+	•	Redirect URIs (voor authorization_code flow)
+	•	Client scope membership-credential moet Assignable zijn en aan client gekoppeld (default/optional)
+	•	In die client-scope moet include.in.token.scope=true (dat had je al eerder gedaan)
+
+
+
+1) Issuance (eenmalig of periodiek)
+
+Vecozo/Keycloak (Issuer) → geeft VC aan Zorgkantoor (wallet/agent)
+Hier kun je wél:
+	•	user-interactive (auth code + PKCE), of
+	•	pre-authorized code (userless)
+
+2) Access (elke keer dat Zorgkantoor bij CIZ wil “inloggen”)
+
+Zorgkantoor presenteert een Verifiable Presentation (VP) met die VC
+CIZ (Verifier) verifieert VP + policies (issuer, status, expiry, audience, challenge/nonce, etc.)
+→ daarna pas toegang verlenen (bijv. session / API token)
+
+KEUZE
+
+Issuance VC
+- Userless ( Pre Authorized Code Flow )
+- Met User die juiste rollen heeft tbv VC 
+
+
+	1.	Issuer (Keycloak) maakt een Credential Offer met een pre-authorized_code (eventueel met tx_code/PIN)
+	2.	Wallet/agent wisselt die code om bij /token met grant type urn:ietf:params:oauth:grant-type:pre-authorized_code  ￼
+	3.	Wallet/agent haalt de VC op bij credential_endpoint met proof (holder binding)
+
+⸻
+1) Credential Offer maken (Keycloak “offer endpoint”)
+
+
+
+Probleem
+
+ontbrekende role credential-offer-create in realm
+KC_BASE="https://vecozo-keycloak.vuggie.net"
+REALM="vc-demo"
+ADMIN_TOKEN=$(./getAdminToken.sh)
+
+curl -sS -X POST "$KC_BASE/admin/realms/$REALM/roles" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"credential-offer-create","description":"Allow creating OID4VC credential offers"}'
+
+
+A) Zorg dat zorgkantoor-jwtvc als client-scope aan zorgkantoor-wallet hangt
+fix1.sh
+
+Fix: zet include.in.token.scope=true op de client scope zorgkantoor-jwtvc
+fix2.sh
+
+Fix: zet protocol van deze client-scope naar openid-connect
+fix3.sh
+
+Oplossing: split de scope in 2 client-scopes
+
+We maken een tweede client-scope met dezelfde naam/ID voor OIDC is onmogelijk (naam moet uniek), dus we doen dit:
+	•	zorgkantoor-jwtvc (protocol oid4vc) → blijft voor offer generation + metadata
+	•	zorgkantoor-jwtvc-oidc (protocol openid-connect) → alleen om credential endpoint scope lookup tevreden te stellen
+
+
+Stap A — Maak client scope zorgkantoor-jwtvc-oidc (openid-connect)
+
+
+1) Haal zorgkantoor-jwtvc uit default client scopes van zorgkantoor-wallet
+
+Stap 2 — Maak een OIDC client-scope met naam zorgkantoor-jwtvc
+fix6.sh
+
+
+=================
+
+Je hebt nu een setup met 2 scopes:
+	•	OID4VC scope naam: zorgkantoor-jwtvc-oid4vc (protocol oid4vc) → alleen voor offer/metadata
+	•	OIDC scope naam: zorgkantoor-jwtvc (protocol openid-connect) → voor token scope lookup in credential endpoint
+	•	(extra) zorgkantoor-jwtvc-oidc (protocol openid-connect) → ok om erbij te hebben, maar niet verplicht
+
+
+KEUZES authenticatie VC
+
+EXPECTED_SCOPE=zorgkantoor-jwtvc-oid4vc-oid4vc-oid4vc
+
+
+
+ pre-authorized offer → pre-auth code → access_toke ...dmv...getToken.sh
+
+
+
+Doelarchitectuur (simpel)
+	•	1 oid4vc client-scope: publiceert de credential config (metadata/offers)
+	•	1 openid-connect client-scope met exact de zelfde naam als de scope in .well-known (bridge voor /credential lookup)
+	•	Wallet client (zorgkantoor-wallet) krijgt default scopes: openid standaard scopes + de OIDC bridge scope (niet de oid4vc scope)
+	•	Offer service client (issuer-offer-service) doet client_credentials en roept credential-offer-uri aan
