@@ -9,6 +9,7 @@ In this demo we emulate a simple flow:
 
 This Verifiable Credential demo aligns with European and Dutch healthcare regulatory ambitions by implementing decentralized, cryptographically verifiable identity and authorization mechanisms consistent with the eIDAS 2.0 framework, the European Digital Identity Wallet, and Dutch national initiatives such as the Landelijk Vertrouwenstelsel, NEN 7510, and the MedMij and Nuts trust frameworks, enabling secure, privacy-preserving, and interoperable exchange of healthcare identity and authorization attributes under the principles of data minimization, strong authentication, and verifiable trust.
 
+Please note that the issuer service is made for DEMO purposes to show the concept of a VC Issuance. In a production environment an enterprise grade PKI infrastructure will take care of the keys and signing.
 
 ```mermaid
 sequenceDiagram
