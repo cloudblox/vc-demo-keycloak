@@ -14,38 +14,54 @@ Please note that the issuer service is made for DEMO purposes to show the concep
 ```mermaid
 sequenceDiagram
   autonumber
-  participant W as Zorgkantoor Wallet<br/>(localhost:3000)
-  participant AS as Keycloak Authorization Server<br/>(token endpoint)
-  participant IS as Keycloak OID4VC Issuer<br/>(credential endpoint)
-  participant VCStore as Wallet VC Store<br/>(/credentials/latest)
-  participant V as CIZ Verifier / Resource API<br/>(localhost:8002)
 
-  Note over W,AS: 1) Autorisatie om issuance te mogen doen (OAuth/OIDC)
-  W->>AS: Run getToken.sh → token request<br/>client auth + scope for credential
-  AS-->>W: access_token (Bearer)
+  participant VO as Vecozo Offer Service
+  participant AS as Keycloak Authorization Server
+  participant IS as Vecozo Issuer Service
+  participant W as Zorgkantoor Wallet
+  participant VCStore as Wallet VC Store
+  participant V as CIZ Verifier
 
-  Note over W,IS: 2) Issuance start: wallet vraagt credential aan
-  W->>IS: POST /credential (1e poging)<br/>Authorization: Bearer access_token<br/>body: {credential_configuration_id, ...}<br/>(proof ontbreekt of ongeldig)
-  IS-->>W: error=invalid_proof + c_nonce + c_nonce_expires_in
+  Note over VO,AS: 1. Vecozo initieert issuance en maakt credential offer
+  VO->>AS: client_credentials grant
+  AS-->>VO: OFFER_TOKEN
 
-  Note over W,IS: 3) Wallet bewijst sleutelbezit (Proof-of-Possession)
-  W->>W: Maak proof_jwt<br/>claims: aud=credential_endpoint<br/>nonce=c_nonce<br/>sign met holder private key
-  W->>IS: POST /credential (2e poging)<br/>Authorization: Bearer access_token<br/>body: {..., proof:{proof_type:"jwt", jwt:proof_jwt}}
-  IS-->>W: VC_JWT (ondertekend door issuer)
+  VO->>AS: Create credential offer
+  AS-->>VO: credential_offer_uri
 
-  Note over W,VCStore: 4) Wallet slaat credential op (zodat GETVC werkt)
-  W->>VCStore: Store VC_JWT as latest credential
+  Note over VO,W: 2. Vecozo levert offer aan wallet
+  VO-->>W: credential_offer_uri link
+
+  Note over W,AS: 3. Wallet haalt offer op en redeem pre-authorized_code
+  W->>AS: GET credential_offer_uri
+  AS-->>W: credential_offer with pre-authorized_code
+
+  W->>AS: POST /token with pre-authorized_code
+  AS-->>W: ACCESS_TOKEN
+
+  Note over W,IS: 4. Wallet vraagt nonce en maakt proof
+  W->>IS: POST /credential (no proof)
+  IS-->>W: invalid_proof + c_nonce
+
+  W->>W: Create proof_jwt and sign with holder key
+
+  Note over W,IS: 5. Wallet vraagt credential
+  W->>IS: POST /credential with proof_jwt
+  IS-->>W: VC signed by issuer
+
+  Note over W,VCStore: 6. Wallet slaat VC op
+  W->>VCStore: Store VC
   VCStore-->>W: OK
 
-  Note over W,V: 5) Presentatie + toegang (jullie werkende demo-flow)
-  W->>VCStore: GET /credentials/latest
-  VCStore-->>W: { credential: VC_JWT }
+  Note over W,V: 7. Wallet presenteert VC aan verifier
+  W->>VCStore: GET latest VC
+  VCStore-->>W: VC
 
-  W->>W: Maak VP_JWT (Verifiable Presentation)<br/>aud="ciz-verifier"<br/>embed VC_JWT<br/>sign met holder key
-  W->>V: POST /hello<br/>{ vp_jwt: VP_JWT }
-  V->>V: Verify VP signature + aud<br/>Verify embedded VC (issuer signature, exp)
-  V->>V: Authorize op basis van VC claims (role/sector/etc.)
-  V-->>W: 200 OK (ALLOW) of 403 (DENY)
+  W->>W: Create VP_JWT and sign with holder key
+
+  W->>V: POST VP_JWT
+  V->>V: Verify VP and VC signatures
+  V-->>W: Allow or Deny
   ```
 
 
