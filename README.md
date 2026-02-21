@@ -2,7 +2,14 @@
 
 
 This repo contains a demo that uses Keycloak as Identity provider according to the [Pre-Authorized Code Flow](https://openid.net/specs/openid-4-verifiable-credential-issuance-1_0.html) OID4VC specification.
-This is the technical material that will be used in the hackathon with Zorginstituur Nederland and Vecozo.
+This is the technical material that will be used in the Februari hackathon with Zorginstituut Nederland and Vecozo.
+
+In this demo we emulate a simple flow:
+
+- Zorgkantoor (Wallet) calls CIZ (Verifier) with a VC that has been Issued by Vecozo (Issuer)
+
+This Verifiable Credential demo aligns with European and Dutch healthcare regulatory ambitions by implementing decentralized, cryptographically verifiable identity and authorization mechanisms consistent with the eIDAS 2.0 framework, the European Digital Identity Wallet, and Dutch national initiatives such as the Landelijk Vertrouwenstelsel, NEN 7510, and the MedMij and Nuts trust frameworks, enabling secure, privacy-preserving, and interoperable exchange of healthcare identity and authorization attributes under the principles of data minimization, strong authentication, and verifiable trust.
+
 
 ```mermaid
 sequenceDiagram
@@ -40,7 +47,6 @@ sequenceDiagram
   V->>V: Authorize op basis van VC claims (role/sector/etc.)
   V-->>W: 200 OK (ALLOW) of 403 (DENY)
   ```
-
 
 
 # Pre Requisites
@@ -101,8 +107,52 @@ Keep everything default, and fill in a `uzovi` identifier for eg 9999
 - OIDC4VC enabled, you can find this under "Advanced"
 - Client scope; assign `membership-credential`credential default (this is the one you created a realm setup phase)
 
+## Create config file
 
+In your folder create a .env file with the following content
+```
+KC_CONTAINER='keycloak'
+KC_URL='http://localhost:8443'
+KC_DB_USERNAME='keycloak'
+KC_DB_PASSWORD='[ YOUR KC DB PASSWD ]'
+KEYCLOAK_ADMIN='admin'
+KEYCLOAK_ADMIN_PASSWORD='YOUR KC ADMIN PASSWD'
+OFFER_SERVICE_CLIENT_SECRET='YOUR KC OFFER SERVICE CLIENT PASSWD'
+REALM='vc-demo'
+WALLET_PROOF_EP="https://zorgkantoor-wallet.vuggie.net/make-proof"
+```
 
+# Run demo
 
+- Bring up Infrastructure; 
+  - `docker compose up -d`
+  - Start issuer service (creates VC); cd issuer-service; ./start.sh 
 
+- create VC
+  - `./createVC.sh`
 
+- get latest VC from Issuer
+
+```
+VC_JWT=$(curl -sS http://localhost:3000/credentials/latest | jq -r .credential)
+echo "VC_JWT_LEN=${#VC_JWT}"
+```
+
+- Make VP (needed when calling the Verifier)
+
+```
+VP_JWT=$(curl -sS -X POST http://localhost:3000/make-vp \
+  -H "Content-Type: application/json" \
+  -d '{"verifier_aud":"ciz-verifier"}' | jq -r .vp_jwt)
+```
+
+- Call the Verifier (CIZ)
+
+```
+curl -sS -X POST "http://localhost:8002/hello" \
+  -H "Content-Type: application/json" \
+  -d "{\"vp_jwt\":\"$VP_JWT\"}" | jq .
+```
+
+This should return something like this:
+![alt text](image.png)
