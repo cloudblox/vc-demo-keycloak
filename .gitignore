@@ -1,3 +1,4 @@
 node_modules
+issuer-service/node_modules/
 .env2
 .env
