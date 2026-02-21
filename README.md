@@ -171,4 +171,8 @@ curl -sS -X POST "http://localhost:8002/hello" \
 ```
 
 This should return something like this:
-![alt text](image.png)
+![alt text](./images/image.png)
+
+Based on this demo your VC will look something like this: 
+
+![alt text](./images/image-1.png)
