@@ -1,205 +1,264 @@
 #!/usr/bin/env bash
 set -euo pipefail
-CRED_CONFIG_ID="zorgkantoor-jwtvc"
-WALLET_SCOPE="zorgkantoor-jwtvc-oid4vc-oid4vc"
+set -a
+source .env
+set +a
 
+WALLET_STORE_EP="http://localhost:3000/store"
+
+############################################
+# OID4VCI (pre-auth) -> VC issuance (JWT_VC)
+# Uses USERNAME2 to avoid shell collisions
+############################################
+
+# --- REQUIRED CONFIG ---
 KC_BASE="${KC_BASE:-https://vecozo-keycloak.vuggie.net}"
-REALM="${REALM:-vc-demo}"
+REALM="${REALM:-vc-demo-clean}"
 
-# Offer service client (client_credentials) -> used to create credential offer
-OFFER_CLIENT_ID="${OFFER_CLIENT_ID:-issuer-offer-service}"
-: "${OFFER_CLIENT_SECRET:?Set OFFER_CLIENT_SECRET env var (do not hardcode)}"
-
-# Wallet client id + user to issue to
-WALLET_CLIENT_ID="${WALLET_CLIENT_ID:-zorgkantoor-wallet}"
-TARGET_USERNAME="${TARGET_USERNAME:-zorgkantoor-agent}"
-
-
-KC_BASE="${KC_BASE%/}"
+# Keycloak token endpoint
 TOKEN_EP="$KC_BASE/realms/$REALM/protocol/openid-connect/token"
-OFFER_URI_EP="$KC_BASE/realms/$REALM/protocol/oid4vc/credential-offer-uri"
-OFFER_EP="$KC_BASE/realms/$REALM/protocol/oid4vc/credential-offer"
-CRED_EP="$(curl -sS "$KC_BASE/realms/$REALM/.well-known/openid-credential-issuer" | jq -r '.credential_endpoint')"
+
+# Keycloak offer handle endpoint (realm-scoped; works but may log "deprecated")
+OFFER_HANDLE_EP="$KC_BASE/realms/$REALM/protocol/oid4vc/credential-offer-uri"
+
+# Prefer well-known issuer metadata endpoint (newer form)
+WELLKNOWN_EP="${WELLKNOWN_EP:-$KC_BASE/.well-known/openid-credential-issuer/realms/$REALM}"
+
+# Your wallet client_id (Keycloak client)
+WALLET_CLIENT_ID="${WALLET_CLIENT_ID:-zorgkantoor-wallet}"
+
+# IMPORTANT: Use USERNAME2 instead of USERNAME
+USERNAME2="${USERNAME2:-zorgkantoor-agent}"
+
+# Credential configuration id (Keycloak OID4VC config id)
+# If empty, script will auto-pick the first key from well-known
+CRED_CONFIG_ID="${CRED_CONFIG_ID:-}"
+
+# Offer-service client (confidential) that is allowed to create credential offers
+OFFER_SERVICE_CLIENT_ID='issuer-offer-service'
+OFFER_SERVICE_CLIENT_SECRET="${OFFER_SERVICE_CLIENT_SECRET:-}"
+
+# Issuer-service credential endpoint (MUST match aud in proof JWT)
+ISSUER_CRED_EP="${ISSUER_CRED_EP:-http://localhost:8081/credential}"
+
+# Optional: wallet endpoints (if your wallet supports them)
+# - WALLET_PROOF_EP should return JSON { "proof_jwt": "..." } for given aud+nonce+ccid
+# - WALLET_STORE_EP should accept JSON { "format":"jwt_vc", "credential":"..." }
+WALLET_PROOF_EP="${WALLET_PROOF_EP:-}"
+WALLET_STORE_EP="${WALLET_STORE_EP:-}"
+
+need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1"; exit 1; }; }
+need curl
+need jq
 
 echo "KC_BASE=$KC_BASE"
 echo "REALM=$REALM"
-echo "CRED_EP=$CRED_EP"
-echo "CRED_CONFIG_ID=$CRED_CONFIG_ID"
+echo "WELLKNOWN_EP=$WELLKNOWN_EP"
+echo "TOKEN_EP=$TOKEN_EP"
+echo "OFFER_HANDLE_EP=$OFFER_HANDLE_EP"
+echo "ISSUER_CRED_EP=$ISSUER_CRED_EP"
 echo "WALLET_CLIENT_ID=$WALLET_CLIENT_ID"
-echo "TARGET_USERNAME=$TARGET_USERNAME"
+echo "USERNAME2=$USERNAME2"
 echo
 
-########################################
-# 1) Get OFFER_TOKEN (client_credentials)
-########################################
-OFFER_TOKENS="$(curl -sS -X POST "$TOKEN_EP" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "grant_type=client_credentials" \
-  -d "client_id=$OFFER_CLIENT_ID" \
-  -d "client_secret=$OFFER_CLIENT_SECRET")"
+############################################
+# 1) Discover CRED_CONFIG_ID (optional)
+############################################
+if [[ -z "${CRED_CONFIG_ID}" ]]; then
+  echo "== 1) Discover credential configuration id from well-known =="
+  CRED_CONFIG_ID="$(curl -sS "$WELLKNOWN_EP" | jq -r '.credential_configurations_supported | keys[0]')"
+  [[ -n "$CRED_CONFIG_ID" && "$CRED_CONFIG_ID" != "null" ]] || { echo "Could not discover CRED_CONFIG_ID"; exit 1; }
+fi
+echo "CRED_CONFIG_ID=$CRED_CONFIG_ID"
+echo
 
-OFFER_TOKEN="$(echo "$OFFER_TOKENS" | jq -r '.access_token')"
-if [ -z "${OFFER_TOKEN:-}" ] || [ "$OFFER_TOKEN" = "null" ]; then
-  echo "Failed to obtain OFFER_TOKEN:" >&2
-  echo "$OFFER_TOKENS" | jq >&2 || echo "$OFFER_TOKENS" >&2
+############################################
+# 2) Offer-service token (client_credentials)
+############################################
+echo "== 2) Offer-service token =="
+if [[ -z "$OFFER_SERVICE_CLIENT_SECRET" ]]; then
+  echo "ERROR: Set OFFER_SERVICE_CLIENT_SECRET env var for client '$OFFER_SERVICE_CLIENT_ID'"
   exit 1
 fi
+
+
+echo "XXXXXXXXXXXXX"
+echo "$TOKEN_EP"
+echo "$OFFER_SERVICE_CLIENT_ID"
+echo "$OFFER_SERVICE_CLIENT_SECRET"
+echo "XXXXXXXXXXXXX"
+
+OFFER_TOKEN="$(
+  curl -sS -X POST "$TOKEN_EP" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -d "grant_type=client_credentials" \
+    -d "client_id=$OFFER_SERVICE_CLIENT_ID" \
+    -d "client_secret=$OFFER_SERVICE_CLIENT_SECRET" \
+  | jq -r '.access_token'
+)"
+
+[[ -n "$OFFER_TOKEN" && "$OFFER_TOKEN" != "null" ]] || { echo "Failed to obtain OFFER_TOKEN"; exit 1; }
 echo "OFFER_TOKEN_LEN=${#OFFER_TOKEN}"
 echo
 
-########################################
-# 2) Create offer handle + immediately fetch offer JSON (avoid expiry)
-########################################
-RESP="$(curl -sS -X GET \
-  "$OFFER_URI_EP?credential_configuration_id=$CRED_CONFIG_ID&pre_authorized=true&client_id=$WALLET_CLIENT_ID&username=$TARGET_USERNAME&type=uri" \
-  -H "Authorization: Bearer $OFFER_TOKEN")"
+############################################
+# 3) Create credential offer handle (nonce)
+############################################
+echo "== 3) Offer handle =="
+OFFER_HANDLE="$(
+  curl -sS -G "$OFFER_HANDLE_EP" \
+    --data-urlencode "credential_configuration_id=$CRED_CONFIG_ID" \
+    --data-urlencode "pre_authorized=true" \
+    --data-urlencode "client_id=$WALLET_CLIENT_ID" \
+    --data-urlencode "username=$USERNAME2" \
+    --data-urlencode "type=uri" \
+    -H "Authorization: Bearer $OFFER_TOKEN"
+)"
+echo "$OFFER_HANDLE" | jq
 
-echo "Offer handle:"
-echo "$RESP" | jq
+OFFER_ISSUER="$(echo "$OFFER_HANDLE" | jq -r '.issuer // empty')"
+NONCE="$(echo "$OFFER_HANDLE" | jq -r '.nonce // empty')"
+[[ -n "$OFFER_ISSUER" && -n "$NONCE" ]] || { echo "Offer handle missing issuer/nonce"; exit 1; }
 
-OFFER_NONCE="$(echo "$RESP" | jq -r '.nonce // empty')"
-if [ -z "$OFFER_NONCE" ]; then
-  echo "Offer handle did not return nonce (offer creation failed)." >&2
-  exit 1
-fi
-
-OFFER_JSON="$(curl -sS -X GET \
-  "$OFFER_EP/$OFFER_NONCE" \
-  -H "Authorization: Bearer $OFFER_TOKEN")"
-
+echo "OFFER_ISSUER=$OFFER_ISSUER"
+echo "NONCE=$NONCE"
 echo
-echo "Offer JSON:"
+
+############################################
+# 4) Fetch offer JSON and extract PA_CODE
+############################################
+echo "== 4) Offer JSON (immediate) =="
+OFFER_JSON="$(curl -sS "${OFFER_ISSUER}${NONCE}")"
 echo "$OFFER_JSON" | jq
 
 PA_CODE="$(echo "$OFFER_JSON" | jq -r '.grants["urn:ietf:params:oauth:grant-type:pre-authorized_code"]["pre-authorized_code"] // empty')"
-if [ -z "$PA_CODE" ]; then
-  echo "No pre-authorized_code found in offer JSON." >&2
-  exit 1
-fi
-
-TX_REQUIRED="$(echo "$OFFER_JSON" | jq -r '.grants["urn:ietf:params:oauth:grant-type:pre-authorized_code"]["tx_code_required"] // false')"
-
-echo
+[[ -n "$PA_CODE" && "$PA_CODE" != "null" ]] || { echo "No pre-authorized_code in offer"; exit 1; }
 echo "PA_CODE=$PA_CODE"
-echo "TX_REQUIRED=$TX_REQUIRED"
 echo
 
-########################################
-# 3) Wallet access token (pre-authorized_code) - OIDC scopes ONLY
-#    IMPORTANT: do NOT request zorgkantoor-jwtvc-oid4vc here.
-########################################
-
-TOKENS="$(curl -sS -X POST "$TOKEN_EP" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "grant_type=urn:ietf:params:oauth:grant-type:pre-authorized_code" \
-  -d "pre-authorized_code=$PA_CODE" \
-  -d "client_id=$WALLET_CLIENT_ID" \
-  -d "scope=$WALLET_SCOPE"
+############################################
+# 5) Exchange PA_CODE for ACCESS_TOKEN
+############################################
+echo "== 5) Wallet token =="
+TOKENS="$(
+  curl -sS -X POST "$TOKEN_EP" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -d "grant_type=urn:ietf:params:oauth:grant-type:pre-authorized_code" \
+    -d "client_id=$WALLET_CLIENT_ID" \
+    -d "pre-authorized_code=$PA_CODE"
 )"
-
-echo "Wallet token response:"
-echo "$TOKENS" | jq
+echo "$TOKENS" | jq '{token_type, expires_in, scope, access_token_len:(.access_token|tostring|length)}'
 
 ACCESS_TOKEN="$(echo "$TOKENS" | jq -r '.access_token // empty')"
-if [ -z "$ACCESS_TOKEN" ]; then
-  echo "No access_token in wallet token response." >&2
-  exit 1
-fi
-
+[[ -n "$ACCESS_TOKEN" && "$ACCESS_TOKEN" != "null" ]] || { echo "No access_token returned"; exit 1; }
 echo "ACCESS_TOKEN_LEN=${#ACCESS_TOKEN}"
+echo
+echo $ACCESS_TOKEN
+echo
 
-# Debug: show token scope claim and fail fast if oid4vc scope leaks in
-TOKEN_SCOPE=$(
-  echo "$ACCESS_TOKEN" | cut -d. -f2 \
-  | tr '_-' '/+' \
-  | awk '{print $0 "==="}' \
-  | base64 -d 2>/dev/null \
-  | jq -r '.scope' || true
-)
-echo "TOKEN_SCOPE=[$TOKEN_SCOPE]"
-
-########################################
-# 4) Probe to get c_nonce
-########################################
-PROBE="$(curl -sS -X POST "$CRED_EP" \
-  -H "Authorization: Bearer $ACCESS_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"credential_configuration_id\": \"$CRED_CONFIG_ID\",
-    \"proof\": { \"proof_type\": \"jwt\", \"jwt\": \"dummy\" }
-  }")"
-
-echo "Probe response:"
+############################################
+# 6) Probe issuer-service to get c_nonce
+############################################
+echo "== 6) Probe issuer-service for c_nonce =="
+PROBE="$(
+  curl -sS -X POST "$ISSUER_CRED_EP" \
+    -H "Authorization: Bearer $ACCESS_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "{\"credential_configuration_id\":\"$CRED_CONFIG_ID\",\"proof\":{\"proof_type\":\"jwt\",\"jwt\":\"dummy\"}}"
+)"
 echo "$PROBE" | jq
 
 C_NONCE="$(echo "$PROBE" | jq -r '.c_nonce // empty')"
-if [ -z "$C_NONCE" ]; then
-  echo
-  echo "No c_nonce returned. If error above is invalid_proof without c_nonce, paste it here." >&2
-  exit 1
-fi
+[[ -n "$C_NONCE" ]] || { echo "No c_nonce from issuer-service"; exit 1; }
 echo "C_NONCE=$C_NONCE"
 echo
 
-########################################
-# 5) Create proof JWT + request credential
-########################################
-command -v node >/dev/null || { echo "node not found. Install node to create ES256 proof JWT."; exit 1; }
+############################################
+# 7) Get PROOF_JWT from wallet (required)
+############################################
+echo "== 7) Get PROOF_JWT from wallet =="
 
-if [ ! -d node_modules/jose ]; then
-  echo "Installing jose (local)..."
-  npm i jose >/dev/null
+if [[ -z "$WALLET_PROOF_EP" ]]; then
+  cat <<EOF
+ERROR: WALLET_PROOF_EP not set.
+
+Your wallet must generate PROOF_JWT (it owns the private key).
+Set WALLET_PROOF_EP to an endpoint that returns JSON: { "proof_jwt": "<...>" }
+
+Example idea:
+  WALLET_PROOF_EP="https://zorgkantoor-wallet.vuggie.net/make-proof"
+
+Then this script will call:
+  POST \$WALLET_PROOF_EP
+    { "aud":"$ISSUER_CRED_EP", "nonce":"$C_NONCE", "credential_configuration_id":"$CRED_CONFIG_ID" }
+
+EOF
+  exit 1
 fi
 
-export CRED_EP
-export C_NONCE
+PROOF_REQ="$(jq -nc \
+  --arg aud "$ISSUER_CRED_EP" \
+  --arg nonce "$C_NONCE" \
+  --arg ccid "$CRED_CONFIG_ID" \
+  '{aud:$aud, nonce:$nonce, credential_configuration_id:$ccid}')"
 
-PROOF_JWT="$(node - <<'NODE'
-import fs from "fs";
-import { SignJWT, generateKeyPair, exportJWK, importJWK } from "jose";
+PROOF_RESP="$(curl -sS -X POST "$WALLET_PROOF_EP" \
+  -H "Content-Type: application/json" \
+  -d "$PROOF_REQ")"
 
-const aud = process.env.CRED_EP;
-const nonce = process.env.C_NONCE;
-
-const privPath = ".holder_private.jwk";
-const pubPath  = ".holder_public.jwk";
-
-let privJwk;
-if (fs.existsSync(privPath)) {
-  privJwk = JSON.parse(fs.readFileSync(privPath, "utf8"));
-} else {
-  const { privateKey, publicKey } = await generateKeyPair("ES256");
-  const pub = await exportJWK(publicKey);
-  privJwk = await exportJWK(privateKey);
-  const kid = "holder-key-1";
-  pub.kid = kid; privJwk.kid = kid;
-  fs.writeFileSync(pubPath, JSON.stringify(pub, null, 2));
-  fs.writeFileSync(privPath, JSON.stringify(privJwk, null, 2));
-}
-
-const key = await importJWK(privJwk, "ES256");
-
-const jwt = await new SignJWT({ nonce })
-  .setProtectedHeader({ alg: "ES256", typ: "JWT", kid: privJwk.kid })
-  .setIssuer("holder")
-  .setAudience(aud)
-  .setIssuedAt()
-  .sign(key);
-
-process.stdout.write(jwt);
-NODE
-)"
+PROOF_JWT="$(echo "$PROOF_RESP" | jq -r '.proof_jwt // empty')"
+[[ -n "$PROOF_JWT" ]] || { echo "Wallet did not return proof_jwt. Response:"; echo "$PROOF_RESP" | jq; exit 1; }
 
 echo "PROOF_JWT_LEN=${#PROOF_JWT}"
+echo
 
-VC_RESP="$(curl -sS -X POST "$CRED_EP" \
+# Extra test: decode PROOF_JWT header to verify it's well-formed (optional)
+echo "$PROOF_JWT" | awk -F. '{print $1}' | tr '_-' '/+' | base64 -d 
+echo
+
+############################################
+# 8) Request credential from issuer-service
+############################################
+
+
+echo "== 8) Request credential =="
+
+HOLDER_KID="${HOLDER_KID:-did:web:zorgkantoor-wallet.vuggie.net#key-1}"
+
+CRED_REQ="$(jq -nc \
+  --arg ccid "$CRED_CONFIG_ID" \
+  --arg holderKid "$HOLDER_KID" \
+  --arg jwt "$PROOF_JWT" \
+  '{credential_configuration_id:$ccid, holderKid:$holderKid, proof:{proof_type:"jwt", jwt:$jwt}}')"
+
+CRED_RESP="$(curl -sS -X POST "$ISSUER_CRED_EP" \
   -H "Authorization: Bearer $ACCESS_TOKEN" \
   -H "Content-Type: application/json" \
-  -d "{
-    \"credential_configuration_id\": \"$CRED_CONFIG_ID\",
-    \"proof\": { \"proof_type\": \"jwt\", \"jwt\": \"$PROOF_JWT\" }
-  }")"
+  -d "$CRED_REQ")"
 
+echo "$CRED_RESP" | jq
+
+VC_JWT="$(echo "$CRED_RESP" | jq -r '.credential // empty')"
+[[ -n "$VC_JWT" ]] || { echo "No credential returned"; exit 1; }
+
+echo "VC_JWT_LEN=${#VC_JWT}"
+echo "VC_JWT=$VC_JWT"
 echo
-echo "Credential response:"
-echo "$VC_RESP" | jq
+
+############################################
+# 9) Store VC in wallet (optional)
+############################################
+if [[ -n "$WALLET_STORE_EP" ]]; then
+  echo "== 9) Store VC in wallet =="
+  STORE_REQ="$(jq -nc --arg fmt "jwt_vc" --arg cred "$VC_JWT" \
+    '{format:$fmt, credential:$cred}')"
+
+  STORE_RESP="$(curl -sS -X POST "$WALLET_STORE_EP" \
+    -H "Content-Type: application/json" \
+    -d "$STORE_REQ")"
+
+  echo "$STORE_RESP" | jq || echo "$STORE_RESP"
+  echo "Stored via WALLET_STORE_EP=$WALLET_STORE_EP"
+else
+  echo "NOTE: WALLET_STORE_EP not set. VC printed above; store it using your wallet's API."
+fi

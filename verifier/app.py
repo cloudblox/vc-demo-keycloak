@@ -1,168 +1,168 @@
-import base64
-import json
 import os
-from typing import Any, Dict, Optional
+import json
+import base64
+from typing import Any, Dict, Optional, List
 
 import httpx
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 from jose import jwt
-from jose.exceptions import JWTError
+from jose.utils import base64url_decode
 
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives import serialization
+app = FastAPI(title="CIZ Verifier (VP-gated Hello World)")
 
-app = FastAPI(title="CIZ Verifier")
+# Vecozo (Keycloak realm) - used to verify VC signatures
+EXPECTED_ISSUER = os.getenv("EXPECTED_ISSUER", "").rstrip("/")
+ISSUER_JWKS_URL = os.getenv("ISSUER_JWKS_URL", "")  # e.g. https://.../realms/<realm>/protocol/openid-connect/certs
+EXPECTED_VC_TYPE = os.getenv("EXPECTED_VC_TYPE", "ZorgkantoorCredential")
 
-KC_BASE = os.getenv("KC_BASE", "").rstrip("/")
-REALM = os.getenv("REALM", "vc-demo")
+# Holder DID (Zorgkantoor wallet) - used to verify VP signature
+EXPECTED_HOLDER_DID = os.getenv("EXPECTED_HOLDER_DID", "did:web:zorgkantoor-wallet.vuggie.net")
+# Our verifier audience that the wallet should set as aud in the vp_jwt (optional but recommended)
+VERIFIER_AUD = os.getenv("VERIFIER_AUD", "ciz-verifier")
 
-# did:web for this verifier host
-DID_WEB = os.getenv("DID_WEB", "did:web:ciz-verifier.vuggie.net")
-VERIFIER_KEY_PATH = os.getenv("VERIFIER_KEY_PATH", "/data/verifier-ec256.pem")
-
-# (optional) expectations
-EXPECTED_VC_CONFIG_ID = os.getenv("EXPECTED_VC_CONFIG_ID", "")
-EXPECTED_ISSUER = os.getenv("EXPECTED_ISSUER", "")  # if set, enforce issuer claim
-
-# Stable verifier key (only for DID doc / optional signing)
-VERIFIER_PRIVATE_KEY: Optional[ec.EllipticCurvePrivateKey] = None
-VERIFIER_PUBLIC_JWK: Optional[Dict[str, Any]] = None
+# Cache
+_JWKS_CACHE: Optional[Dict[str, Any]] = None
 
 
-def b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+class HelloRequest(BaseModel):
+    vp_jwt: str
 
 
-def load_or_create_verifier_keypair() -> None:
-    """
-    Persist a P-256 key so the verifier DID document stays stable across restarts.
-    (Not required for verifying, but useful for did:web.)
-    """
-    global VERIFIER_PRIVATE_KEY, VERIFIER_PUBLIC_JWK
-
-    try:
-        if os.path.exists(VERIFIER_KEY_PATH):
-            with open(VERIFIER_KEY_PATH, "rb") as f:
-                pem = f.read()
-            VERIFIER_PRIVATE_KEY = serialization.load_pem_private_key(pem, password=None)
-        else:
-            VERIFIER_PRIVATE_KEY = ec.generate_private_key(ec.SECP256R1())
-            os.makedirs(os.path.dirname(VERIFIER_KEY_PATH), exist_ok=True)
-            pem = VERIFIER_PRIVATE_KEY.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.PKCS8,
-                encryption_algorithm=serialization.NoEncryption(),
-            )
-            with open(VERIFIER_KEY_PATH, "wb") as f:
-                f.write(pem)
-    except Exception:
-        # fallback: in-memory key
-        VERIFIER_PRIVATE_KEY = ec.generate_private_key(ec.SECP256R1())
-
-    pub = VERIFIER_PRIVATE_KEY.public_key()
-    nums = pub.public_numbers()
-    x = nums.x.to_bytes(32, "big")
-    y = nums.y.to_bytes(32, "big")
-
-    VERIFIER_PUBLIC_JWK = {
-        "kty": "EC",
-        "crv": "P-256",
-        "x": b64url(x),
-        "y": b64url(y),
-        "use": "sig",
-        "alg": "ES256",
-        "kid": "ciz-verifier-key-1",
-    }
+def _b64url_json(segment: str) -> Dict[str, Any]:
+    seg = segment + "=" * (-len(segment) % 4)
+    return json.loads(base64.urlsafe_b64decode(seg.encode("ascii")).decode("utf-8"))
 
 
-@app.on_event("startup")
-def _startup() -> None:
-    load_or_create_verifier_keypair()
-
-
-@app.get("/")
-def health():
-    return {"ok": True, "service": "ciz-verifier"}
-
-
-@app.get("/.well-known/did.json")
-def did_document():
-    if VERIFIER_PUBLIC_JWK is None:
-        load_or_create_verifier_keypair()
-
-    did_doc = {
-        "@context": ["https://www.w3.org/ns/did/v1"],
-        "id": DID_WEB,
-        "verificationMethod": [
-            {
-                "id": f"{DID_WEB}#key-1",
-                "type": "JsonWebKey2020",
-                "controller": DID_WEB,
-                "publicKeyJwk": VERIFIER_PUBLIC_JWK,
-            }
-        ],
-        "authentication": [f"{DID_WEB}#key-1"],
-        "assertionMethod": [f"{DID_WEB}#key-1"],
-    }
-    return JSONResponse(did_doc, media_type="application/did+json")
-
-
-async def get_jwks() -> Dict[str, Any]:
-    oidc = f"{KC_BASE}/realms/{REALM}/.well-known/openid-configuration"
+async def fetch_jwks(url: str) -> Dict[str, Any]:
+    global _JWKS_CACHE
+    if _JWKS_CACHE is not None:
+        return _JWKS_CACHE
     async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(oidc)
+        r = await client.get(url)
         r.raise_for_status()
-        jwks_uri = r.json()["jwks_uri"]
-        r2 = await client.get(jwks_uri)
-        r2.raise_for_status()
-        return r2.json()
+        _JWKS_CACHE = r.json()
+        return _JWKS_CACHE
 
 
-@app.post("/verify")
-async def verify(vp: Dict[str, Any]):
-    """
-    Minimal verifier:
-    - expects VP JSON with:
-        {
-          "type": "VerifiablePresentation",
-          "holder": {<holder public jwk or did>},
-          "verifiableCredential": "<jwt>"
-        }
-    - verifies VC JWT signature against Keycloak realm JWKS
-    """
-    vc_jwt = vp.get("verifiableCredential")
-    holder = vp.get("holder")
+async def resolve_did_web(did: str) -> Dict[str, Any]:
+    # did:web:example.com -> https://example.com/.well-known/did.json
+    if not did.startswith("did:web:"):
+        raise HTTPException(status_code=400, detail=f"Only did:web supported in demo, got {did}")
+    host = did[len("did:web:"):]
+    url = f"https://{host}/.well-known/did.json"
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        return r.json()
 
-    if not vc_jwt:
-        return {"ok": False, "error": "missing verifiableCredential"}
 
-    jwks = await get_jwks()
+def find_vm_jwk(did_doc: Dict[str, Any], kid: str) -> Dict[str, Any]:
+    vms = did_doc.get("verificationMethod", []) or []
+    for vm in vms:
+        if vm.get("id") == kid and vm.get("publicKeyJwk"):
+            return vm["publicKeyJwk"]
+    raise HTTPException(status_code=401, detail=f"Holder key {kid} not found in DID doc")
+
+
+async def verify_vp_jwt(vp_jwt: str) -> Dict[str, Any]:
+    parts = vp_jwt.split(".")
+    if len(parts) != 3:
+        raise HTTPException(status_code=400, detail="vp_jwt is not a JWS")
+
+    header = _b64url_json(parts[0])
+    kid = header.get("kid")
+    if not kid or not isinstance(kid, str):
+        raise HTTPException(status_code=401, detail="vp_jwt header.kid missing")
+
+    # Expected kid should belong to our expected holder DID
+    if not kid.startswith(EXPECTED_HOLDER_DID):
+        raise HTTPException(status_code=401, detail=f"vp_jwt kid is not from expected holder DID ({EXPECTED_HOLDER_DID})")
+
+    did_doc = await resolve_did_web(EXPECTED_HOLDER_DID)
+    holder_jwk = find_vm_jwk(did_doc, kid)
+
+    # Verify signature + standard JWT validations
+    try:
+        claims = jwt.decode(
+            vp_jwt,
+            holder_jwk,
+            algorithms=["ES256"],
+            options={"verify_aud": False},  # we'll check aud ourselves
+        )
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"vp_jwt signature/claims invalid: {e}")
+
+    # Optional checks
+    aud = claims.get("aud")
+    if aud and aud != VERIFIER_AUD:
+        raise HTTPException(status_code=401, detail=f"vp_jwt aud mismatch (got {aud}, expected {VERIFIER_AUD})")
+
+    iss = claims.get("iss")
+    if iss != EXPECTED_HOLDER_DID:
+        raise HTTPException(status_code=401, detail=f"vp_jwt iss mismatch (got {iss}, expected {EXPECTED_HOLDER_DID})")
+
+    vp = claims.get("vp")
+    if not isinstance(vp, dict):
+        raise HTTPException(status_code=401, detail="vp_jwt missing vp object")
+
+    vcs = vp.get("verifiableCredential")
+    if not isinstance(vcs, list) or not vcs or not isinstance(vcs[0], str):
+        raise HTTPException(status_code=401, detail="vp.verifiableCredential must be a list of JWT strings")
+
+    return {"claims": claims, "vc_jwt": vcs[0]}
+
+
+async def verify_vc_jwt(vc_jwt: str) -> Dict[str, Any]:
+    if not ISSUER_JWKS_URL:
+        raise HTTPException(status_code=500, detail="ISSUER_JWKS_URL not configured")
+    jwks = await fetch_jwks(ISSUER_JWKS_URL)
 
     try:
-        # Verify VC signature (issuer = Keycloak signing key)
-        claims = jwt.decode(vc_jwt, jwks, options={"verify_aud": False})
-    except JWTError as e:
-        return {"ok": False, "error": "vc_signature_invalid", "details": str(e)}
+        claims = jwt.decode(
+            vc_jwt,
+            jwks,
+            algorithms=["ES256"],
+            audience=None,
+            options={"verify_aud": False},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"VC signature/claims invalid: {e}")
 
-    # Optional issuer check
     if EXPECTED_ISSUER:
         iss = claims.get("iss")
         if iss != EXPECTED_ISSUER:
-            return {"ok": False, "error": "issuer_mismatch", "expected": EXPECTED_ISSUER, "got": iss}
+            raise HTTPException(status_code=401, detail=f"VC iss mismatch (got {iss}, expected {EXPECTED_ISSUER})")
 
-    # Optional: check VC config id if your VC includes it (implementation-specific)
-    # (Many jwt_vc payloads do not include this directly; depends on Keycloak mapping.)
-    config_ok = True
-    if EXPECTED_VC_CONFIG_ID:
-        # naive heuristic: look in "vc" -> "type" or custom claim
-        vc_obj = claims.get("vc") or {}
-        types = vc_obj.get("type") or []
-        config_ok = (EXPECTED_VC_CONFIG_ID in types) or (claims.get("credential_configuration_id") == EXPECTED_VC_CONFIG_ID)
+    vc = claims.get("vc") or {}
+    types = vc.get("type") or []
+    if EXPECTED_VC_TYPE and EXPECTED_VC_TYPE not in types:
+        raise HTTPException(status_code=401, detail=f"VC type mismatch (missing {EXPECTED_VC_TYPE})")
 
+    # Optional: check cnf binding exists
+    cnf = claims.get("cnf") or claims.get("vc", {}).get("cnf") or {}
+    # Your JWT-VC example showed cnf at top-level: claims["cnf"]["kid"]
+    if "kid" not in (claims.get("cnf") or {}):
+        # not fatal for demo, but helpful to enforce if you want
+        pass
+
+    return claims
+
+
+@app.get("/health")
+async def health():
+    return {"ok": True, "service": "ciz-verifier"}
+
+
+@app.post("/hello")
+async def hello(req: HelloRequest):
+    vp_verified = await verify_vp_jwt(req.vp_jwt)
+    vc_claims = await verify_vc_jwt(vp_verified["vc_jwt"])
+
+    # If we got here: VP + VC validated
     return {
-        "ok": True,
-        "holder_present": bool(holder),
-        "vc_config_check": config_ok,
-        "vc_claims": claims,
+        "message": "Hello World",
+        "holder": vc_claims.get("sub"),
+        "issuer": vc_claims.get("iss"),
+        "vc_type": (vc_claims.get("vc") or {}).get("type"),
     }

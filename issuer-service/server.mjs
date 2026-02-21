@@ -3,6 +3,8 @@ import crypto from "crypto";
 import { decodeProtectedHeader, importJWK, jwtVerify, SignJWT } from "jose";
 
 const app = express();
+// If you're behind a reverse proxy (Cloudflare/Nginx), this helps req.protocol/req.get('host') behave.
+app.set("trust proxy", true);
 app.use(express.json({ limit: "1mb" }));
 
 const PORT = process.env.PORT || 8081;
@@ -18,6 +20,26 @@ const CRED_CONFIG_ID = process.env.CRED_CONFIG_ID || "zorgkantoor-jwtvc";
 const ISSUER_KID = process.env.ISSUER_KID || "issuer-es256-1";
 const ISSUER_JWK = JSON.parse(process.env.ISSUER_JWK || "null");
 if (!ISSUER_JWK) throw new Error("ISSUER_JWK env var is required (a JWK for ES256)");
+
+function issuerPublicJwk() {
+  // Publish only public parameters (never leak private "d")
+  const pub = { ...ISSUER_JWK };
+  delete pub.d; delete pub.p; delete pub.q; delete pub.dp; delete pub.dq; delete pub.qi; delete pub.oth;
+  pub.kid = pub.kid || ISSUER_KID;
+  pub.use = pub.use || "sig";
+  pub.alg = pub.alg || "ES256";
+  return pub;
+}
+
+// Public JWKS endpoint for verifiers (CIZ) to verify VC signatures.
+// This is intentionally separate from Keycloak's JWKS (which is for access tokens).
+app.get("/.well-known/jwks.json", (req, res) => {
+  try {
+    res.json({ keys: [issuerPublicJwk()] });
+  } catch (e) {
+    res.status(500).json({ error: "server_error", error_description: e.message });
+  }
+});
 
 // very small in-memory nonce store
 const nonces = new Map(); // access_token_hash -> { nonce, expMs }
@@ -162,7 +184,7 @@ async function verifyHolderProof(proofJwt, expectedAud, expectedNonce) {
   return { mode: "did", did, kid: vmId, jwk: publicKeyJwk, payload };
 }
 
-async function issueJwtVc({ holderKid, subjectDid }) {
+async function issueJwtVc({ holderKid, subjectDid, tokenPayload }) {
 
 const issuerKey = await importJWK(ISSUER_JWK, "ES256");
 const now = Math.floor(Date.now() / 1000);
@@ -170,6 +192,23 @@ const exp = now + 365 * 24 * 3600;
 
 if (!subjectDid) throw new Error("subjectDid is required to issue DID-native VC");
 if (!holderKid) throw new Error("holderKid is required to bind VC to holder DID key");
+
+// Take everything the Authorization Server put under vc.credentialSubject in the access token
+// and embed it into the issued VC's credentialSubject.
+// - We always enforce the subject DID as credentialSubject.id.
+// - We keep existing demo defaults for organization/role only if they are not provided by the token.
+const tokenCs =
+  tokenPayload?.vc?.credentialSubject && typeof tokenPayload.vc.credentialSubject === "object"
+    ? tokenPayload.vc.credentialSubject
+    : {};
+
+const credentialSubject = {
+  ...tokenCs,
+  id: subjectDid
+};
+
+if (!credentialSubject.organization) credentialSubject.organization = "Zorgkantoor";
+if (!credentialSubject.role) credentialSubject.role = "agent";
 
 // Minimal JWT VC payload (DID-native holder binding via cnf.kid)
 const vc = {
@@ -182,11 +221,7 @@ const vc = {
   vc: {
     "@context": ["https://www.w3.org/2018/credentials/v1"],
     type: ["VerifiableCredential", "ZorgkantoorCredential"],
-    credentialSubject: {
-      id: subjectDid,
-      organization: "Zorgkantoor",
-      role: "agent"
-    }
+    credentialSubject
   },
   // DID-native holder binding
   cnf: { kid: holderKid }
@@ -198,6 +233,8 @@ const jwt = await new SignJWT(vc)
 
 return jwt;
 }
+
+app.get("/health", (req, res) => res.json({ ok: true }));
 
 // 1) Optional: explicit nonce endpoint (some wallets use it)
 app.post("/nonce", async (req, res) => {
@@ -255,7 +292,7 @@ app.post("/credential", async (req, res) => {
 
     const subjectDid = holder.mode === "did" ? holder.did : (payload.preferred_username || payload.sub);
     const holderKid = holder.mode === "did" ? holder.kid : null;
-    const credential = await issueJwtVc({ holderKid, subjectDid });
+    const credential = await issueJwtVc({ holderKid, subjectDid, tokenPayload: payload });
 
     res.json({
       format: "jwt_vc",
@@ -266,7 +303,7 @@ app.post("/credential", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`Issuer service listening on :${PORT}`);
   console.log(`KC_ISSUER=${KC_ISSUER}`);
   console.log(`CRED_CONFIG_ID=${CRED_CONFIG_ID}`);

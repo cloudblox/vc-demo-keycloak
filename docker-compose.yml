@@ -70,12 +70,12 @@ services:
   verifier:
     build: ./verifier
     environment:
-      KC_BASE: "https://vecozo-keycloak.vuggie.net"
-      REALM: "vc-demo"
-      EXPECTED_VC_CONFIG_ID: "zorgkantoor-jwtvc"
-      EXPECTED_VCT: ""   # optional
-      DID_WEB: did:web:ciz-verifier.vuggie.net
-      VERIFIER_KEY_PATH: /data/verifier-ec256.pem
+      EXPECTED_ISSUER: "https://vecozo-keycloak.vuggie.net/realms/vc-demo"
+      #ISSUER_JWKS_URL: "https://vecozo-keycloak.vuggie.net/realms/vc-demo-clean/protocol/openid-connect/certs"
+      ISSUER_JWKS_URL: "http://host.docker.internal:8081/.well-known/jwks.json"
+      EXPECTED_VC_TYPE: "ZorgkantoorCredential"
+      EXPECTED_HOLDER_DID: "did:web:zorgkantoor-wallet.vuggie.net"
+      VERIFIER_AUD: "ciz-verifier"
     ports:
       - "8002:8000"
     volumes:

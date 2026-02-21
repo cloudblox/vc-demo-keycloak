@@ -6,6 +6,7 @@ import os
 import time
 import threading
 from typing import Any, Dict, Optional, List
+from pydantic import BaseModel
 
 import httpx
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -352,3 +353,41 @@ async def present_to_verifier(payload: Dict[str, Any]):
         except Exception:
             body = {"raw": r.text}
         return {"status_code": r.status_code, "verifier_response": body}
+
+
+class VPRequest(BaseModel):
+    verifier_aud: str = "ciz-verifier"
+    nonce: str | None = None  # optional
+    vc_jwt: str | None = None # optional; if omitted use latest stored VC
+
+@app.post("/make-vp")
+async def make_vp(req: VPRequest):
+    # pick VC to present
+    vc_jwt = req.vc_jwt
+    if not vc_jwt:
+        # use latest stored if you have persistence; otherwise you can require vc_jwt
+        try:
+            vc_jwt = WALLET_VC_STORE[-1]
+        except Exception:
+            raise HTTPException(status_code=400, detail="No VC available in wallet; store one first")
+
+    ensure_holder_keys()
+    now = int(time.time())
+
+    vp_claims = {
+        "iss": DID_WEB,
+        "aud": req.verifier_aud,
+        "iat": now,
+        "vp": {
+            "type": "VerifiablePresentation",
+            "holder": DID_WEB,
+            "verifiableCredential": [vc_jwt],
+        },
+    }
+    if req.nonce:
+        vp_claims["nonce"] = req.nonce
+
+    headers = {"typ": "vp+jwt", "alg": "ES256", "kid": f"{DID_WEB}#key-1"}
+    vp_jwt = jwt.encode(vp_claims, _pem_private_key(), algorithm="ES256", headers=headers)
+    return {"vp_jwt": vp_jwt}
+

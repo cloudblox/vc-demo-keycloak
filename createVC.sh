@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+set -a
+source .env
+set +a
 
-OFFER_SERVICE_CLIENT_SECRET='rXqlc4UqxK9sRAsI6A0MIQtVF8ezTwgG'
 WALLET_STORE_EP="http://localhost:3000/store"
 
 ############################################
@@ -11,7 +13,7 @@ WALLET_STORE_EP="http://localhost:3000/store"
 
 # --- REQUIRED CONFIG ---
 KC_BASE="${KC_BASE:-https://vecozo-keycloak.vuggie.net}"
-REALM="${REALM:-vc-demo-clean}"
+REALM="${REALM:-vc-demo}"
 
 # Keycloak token endpoint
 TOKEN_EP="$KC_BASE/realms/$REALM/protocol/openid-connect/token"
@@ -150,6 +152,8 @@ echo "$TOKENS" | jq '{token_type, expires_in, scope, access_token_len:(.access_t
 ACCESS_TOKEN="$(echo "$TOKENS" | jq -r '.access_token // empty')"
 [[ -n "$ACCESS_TOKEN" && "$ACCESS_TOKEN" != "null" ]] || { echo "No access_token returned"; exit 1; }
 echo "ACCESS_TOKEN_LEN=${#ACCESS_TOKEN}"
+echo
+echo $ACCESS_TOKEN
 echo
 
 ############################################
