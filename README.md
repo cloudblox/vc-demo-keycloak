@@ -1,8 +1,7 @@
-# vc-demo-keycloak
-
+# VC Demo, pre authorized code flow
 
 This repo contains a demo that uses Keycloak as Identity provider according to the [Pre-Authorized Code Flow](https://openid.net/specs/openid-4-verifiable-credential-issuance-1_0.html) OID4VC specification.
-This is the technical material that will be used in the Februari hackathon with Zorginstituut Nederland and Vecozo.
+This is the technical material that will be used in the February hackathon with Zorginstituut Nederland and Vecozo.
 
 In this demo we emulate a simple flow:
 
