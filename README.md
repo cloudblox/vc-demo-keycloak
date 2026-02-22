@@ -11,6 +11,8 @@ This Verifiable Credential demo aligns with European and Dutch healthcare regula
 
 Please note that the issuer service is made for DEMO purposes to show the concept of a VC Issuance. In a production environment an enterprise grade PKI infrastructure will take care of the keys and signing.
 
+[Here](./documentation/verifiable-credentials.mp4) is an animation to show the flow of this demo.
+
 ```mermaid
 sequenceDiagram
   autonumber
@@ -147,7 +149,9 @@ WALLET_PROOF_EP="https://zorgkantoor-wallet.vuggie.net/make-proof"
 - create VC
   - `./createVC.sh`
 
-- get latest VC from Issuer
+This emulates all the steps that are done by the Issuer/ Vecozo (create Offer) and the Wallet/ Zorgkantoor in order to create and store an issued and signed VC in a Wallet.
+
+- get latest VC from Wallet
 
 ```
 VC_JWT=$(curl -sS http://localhost:3000/credentials/latest | jq -r .credential)
