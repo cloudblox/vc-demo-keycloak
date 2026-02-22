@@ -11,7 +11,7 @@ This Verifiable Credential demo aligns with European and Dutch healthcare regula
 
 Please note that the issuer service is made for DEMO purposes to show the concept of a VC Issuance. In a production environment an enterprise grade PKI infrastructure will take care of the keys and signing.
 
-[Here](https://raw.githubusercontent.com/cloudblox/vc-demo-keycloak/main/documentation/verifiable-credentials.mp4) is an animation to show the flow of this demo.
+[Here](https://youtu.be/5TsiyJSpB7g) is an animation to show the flow of this demo.
 
 ```mermaid
 sequenceDiagram
